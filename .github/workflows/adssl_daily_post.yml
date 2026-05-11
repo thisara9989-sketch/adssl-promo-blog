@@ -1,29 +1,14 @@
-name: Ads-SL Daily Blog — 10 Auto Posts
+name: Ads-SL Daily Blog
 
 on:
   schedule:
-    - cron: 'name0 4 * * *'   # 4:00 AM UTC = 9:30 AM Sri Lanka time
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v4
-name: Ads-SL Daily Blog — 10 Auto Posts
-
-on:
-  schedule:
-    - cron: '0 4 * * *'   # 4:00 AM UTC = 9:30 AM Sri Lanka time
-  workflow_dispatch:
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
       - uses: actions/checkout@v4
 
@@ -34,21 +19,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Ads-SL Blog Poster
-        env:
-          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
-          BLOGGER_REFRESH_TOKEN: ${{ secrets.BLOGGER_REFRESH_TOKEN }}
-          BLOGGER_CLIENT_ID:     ${{ secrets.BLOGGER_CLIENT_ID }}
-          BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
-          BLOGGER_BLOG_ID:       ${{ secrets.BLOGGER_BLOG_ID }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install requests
-
-      - name: Run Ads-SL Blog Poster
+      - name: Run Blog Poster
         env:
           GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
           BLOGGER_REFRESH_TOKEN: ${{ secrets.BLOGGER_REFRESH_TOKEN }}
@@ -56,4 +27,3 @@ jobs:
           BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
           BLOGGER_BLOG_ID:       ${{ secrets.BLOGGER_BLOG_ID }}
         run: python adssl_blog_poster.py
-        

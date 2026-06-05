@@ -26,4 +26,4 @@ jobs:
           BLOGGER_CLIENT_ID:     ${{ secrets.BLOGGER_CLIENT_ID }}
           BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
           BLOGGER_BLOG_ID:       ${{ secrets.BLOGGER_BLOG_ID }}
-        run: python adssl_blog_v3.py
+        run: python adssl_blog_v2.py

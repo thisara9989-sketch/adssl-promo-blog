@@ -125,7 +125,6 @@ def pick_topics():
     kw_list = ", ".join(cluster[:6])
     sample  = random.sample(TOPIC_BANK, min(20, len(TOPIC_BANK)))
     listed  = "\n".join("- " + t for t in sample)
-
     prompt = (
         "You are a senior SEO content strategist for Ads-SL (ads-sl.com), "
         "Sri Lanka's leading classified ads platform for spa and wellness services.\n\n"
@@ -140,7 +139,6 @@ def pick_topics():
         "Rewrite each title to be SEO powerful, max 65 characters.\n"
         "Return ONLY a numbered list:\n1.\n2.\n3."
     )
-
     text   = ask_ai(prompt, 400)
     topics = []
     for line in text.strip().splitlines():
@@ -169,13 +167,11 @@ def get_promo_block():
         '<p style="color:rgba(255,255,255,0.85);font-size:13px;margin:0 0 14px 0;">Find trusted spa listings, wellness centers and beauty services across Sri Lanka.</p>'
         '<a href="' + SITE_URL + '" target="_blank" rel="noopener" style="background:#fff;color:#764ba2;padding:11px 28px;border-radius:30px;font-weight:700;font-size:14px;text-decoration:none;display:inline-block;">Explore Ads-SL.com</a>'
         '</div>',
-
         '<div style="background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:20px 24px;margin:0 0 28px 0;box-shadow:0 2px 10px rgba(0,0,0,0.06);">'
         '<p style="color:#1e293b;font-size:15px;font-weight:700;margin:0 0 4px 0;">Looking for spa services in Sri Lanka?</p>'
         '<p style="color:#64748b;font-size:13px;margin:0 0 10px 0;">Browse verified spa ads, wellness centers and beauty listings at Ads-SL.com - Sri Lanka\'s trusted ad platform.</p>'
         '<a href="' + SITE_URL + '" target="_blank" rel="noopener" style="background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:8px 20px;border-radius:20px;font-weight:700;font-size:13px;text-decoration:none;display:inline-block;">Visit Ads-SL.com</a>'
         '</div>',
-
         '<div style="background:linear-gradient(135deg,#f0fdf4,#dcfce7);border-left:5px solid #22c55e;border-radius:0 14px 14px 0;padding:18px 22px;margin:0 0 28px 0;">'
         '<p style="color:#166534;font-size:15px;font-weight:700;margin:0 0 6px 0;">Advertised on Ads-SL.com</p>'
         '<p style="color:#374151;font-size:13px;margin:0 0 12px 0;">Sri Lanka\'s leading platform for spa, wellness and beauty classified ads. Find listings or advertise your business today.</p>'
@@ -191,7 +187,6 @@ def generate_post(topic, img_url, tags):
     kw_str      = ", ".join(kw_sample)
     promo_block = get_promo_block()
     tag_str     = ", ".join(tags[:6])
-
     prompt = (
         "You are an expert Sri Lankan lifestyle and wellness blogger for " + month_year + ".\n\n"
         "Topic: " + topic + "\n"
@@ -219,12 +214,11 @@ def generate_post(topic, img_url, tags):
         "- Mention Colombo, Kandy, Galle, Negombo, Bentota, Mirissa\n"
         "- Use keywords 5-7 times naturally\n"
         "- Reference ads-sl.com 2-3 times in body naturally\n"
-        "- NO cliches: no 'In today's world', 'Game changer', 'Dive in'\n"
+        "- NO cliches: no In today's world, no Game changer, no Dive in\n"
         "- Sound 100 percent human\n"
         "- Use HTML tags: h2, h3, p, blockquote, ul, li, strong\n\n"
         "IMPORTANT: Write [PROMO_BLOCK] as exact placeholder text."
     )
-
     raw = ask_ai(prompt, 4000)
     raw = raw.replace("[PROMO_BLOCK]", promo_block)
     return raw
@@ -235,7 +229,6 @@ def parse_post(raw, fallback_tags):
     tags          = fallback_tags
     content_lines = []
     in_content    = False
-
     for line in lines:
         if line.startswith("TITLE:"):
             title = line.replace("TITLE:", "").strip().strip('"')
@@ -243,10 +236,8 @@ def parse_post(raw, fallback_tags):
             in_content = True
         elif in_content:
             content_lines.append(line)
-
     if not content_lines:
         content_lines = [l for l in lines if not l.startswith(("TITLE:", "META:", "---"))]
-
     return title, "\n".join(content_lines), tags
 
 def get_access_token():
@@ -284,61 +275,46 @@ def main():
     print("Promoting: " + SITE_URL)
     print("Today keyword cluster: " + cluster[0])
     print("=" * 60)
-
     publish_times = get_publish_times()
     print("Post schedule (UTC):")
     for i, t in enumerate(publish_times, 1):
         sl_time = t + timedelta(hours=5, minutes=30)
         print("  Post " + str(i) + ": " + t.strftime("%H:%M") + " UTC / " + sl_time.strftime("%H:%M") + " SL")
-
     print("\nAI researching best topics...")
     topics = pick_topics()
     if not topics:
         print("ERROR: Topic generation failed")
         return
-
     print("Selected topics:")
     for i, t in enumerate(topics, 1):
         print("  " + str(i) + ". " + t)
-
     token   = get_access_token()
     success = 0
-
     print("\nWriting " + str(len(topics)) + " posts...\n")
-
     for i, topic in enumerate(topics, 1):
         print("[" + str(i) + "/3] " + topic[:65])
-
         shuffled  = cluster.copy()
         random.shuffle(shuffled)
         post_tags = shuffled[:10]
-
         try:
             print("  Generating image...")
             img_url = get_image_url(topic)
-
             print("  Writing post...")
             raw = generate_post(topic, img_url, post_tags)
-
             title, content, tags = parse_post(raw, post_tags)
-
             pub_time = publish_times[i - 1]
             result   = publish_post(title, content, tags, token, pub_time)
             url      = result.get("url", "scheduled")
             sl_time  = pub_time + timedelta(hours=5, minutes=30)
-
             print("  OK - Scheduled: " + pub_time.strftime("%H:%M") + " UTC / " + sl_time.strftime("%H:%M") + " SL")
             print("  URL: " + str(url) + "\n")
             success += 1
-
         except Exception as e:
             print("  ERROR: " + str(e) + "\n")
-
         if i < len(topics):
             wait = random.randint(20, 35)
             print("  Waiting " + str(wait) + "s...\n")
             time.sleep(wait)
-
     print("=" * 60)
     print("Done: " + str(success) + "/3 posts scheduled")
     print("All linking to: " + SITE_URL)

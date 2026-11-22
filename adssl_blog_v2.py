@@ -1,4 +1,4 @@
-import os, random, requests, time, hashlib
+import os, re, random, requests, time, hashlib
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -7,10 +7,20 @@ REFRESH_TOKEN = os.environ["BLOGGER_REFRESH_TOKEN"]
 CLIENT_ID     = os.environ["BLOGGER_CLIENT_ID"]
 CLIENT_SECRET = os.environ["BLOGGER_CLIENT_SECRET"]
 BLOG_ID       = os.environ["BLOGGER_BLOG_ID"]
+PEXELS_KEY    = os.environ.get("PEXELS_API_KEY", "")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 HEADERS  = {"Authorization": "Bearer " + GROQ_KEY, "Content-Type": "application/json"}
-MODEL    = "llama-3.3-70b-versatile"
+
+# Model is configurable: set GROQ_MODEL in the workflow to switch without editing code.
+# If the first model is gone, the script automatically tries the next one.
+MODELS = [m for m in [
+    os.environ.get("GROQ_MODEL", "").strip(),
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+] if m]
+MODELS = list(dict.fromkeys(MODELS))
+
 SITE_URL = "https://www.ads-sl.com/"
 
 KEYWORD_CLUSTERS = [
@@ -76,89 +86,290 @@ TOPIC_BANK = [
     "top rated massage centers listed on lanka ads Sri Lanka",
 ]
 
+
 def get_todays_cluster():
     day_index = datetime.now().timetuple().tm_yday
     return KEYWORD_CLUSTERS[day_index % len(KEYWORD_CLUSTERS)]
 
+
 def get_publish_times():
-    now = datetime.utcnow()
+    """3 random times per day: one morning, one afternoon, one evening (Sri Lanka time)."""
+    now_utc = datetime.utcnow()
+    sl_offset = timedelta(hours=5, minutes=30)
+    sl_today = (now_utc + sl_offset).replace(hour=0, minute=0, second=0, microsecond=0)
+    windows = [(8, 11), (13, 16), (18, 22)]  # SL hours
     times = []
-    current = now + timedelta(hours=random.uniform(1, 2))
-    for _ in range(3):
-        times.append(current)
-        gap = random.uniform(2.5, 5.0)
-        current += timedelta(hours=gap)
-    return times
+    for start_h, end_h in windows:
+        minutes = random.randint(start_h * 60, end_h * 60 - 1)
+        t_utc = sl_today + timedelta(minutes=minutes) - sl_offset
+        if t_utc < now_utc + timedelta(minutes=15):  # window already passed -> tomorrow
+            t_utc += timedelta(days=1)
+        times.append(t_utc)
+    return sorted(times)
 
+
+# ---------------------------------------------------------------- Groq
 def ask_ai(prompt, max_tokens=4000):
-    for attempt in range(3):
-        try:
-            resp = requests.post(GROQ_URL,
-                headers=HEADERS,
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.83
-                },
-                timeout=90
-            )
-            data = resp.json()
-            if "choices" in data:
-                return data["choices"][0]["message"]["content"]
-            print("Groq error attempt " + str(attempt+1) + ":", data)
-            time.sleep(10)
-        except Exception as e:
-            print("Request error attempt " + str(attempt+1) + ": " + str(e))
-            time.sleep(10)
-    raise Exception("Groq API failed after 3 attempts")
+    """Try each model in MODELS. Skips to the next model if one no longer exists."""
+    last_error = None
+    for model in MODELS:
+        use_reasoning_param = model.startswith("openai/gpt-oss")
+        for attempt in range(3):
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.83,
+            }
+            if use_reasoning_param:
+                payload["reasoning_effort"] = "low"
+            try:
+                resp = requests.post(GROQ_URL, headers=HEADERS, json=payload, timeout=120)
+                data = resp.json()
+                if "choices" in data:
+                    text = (data["choices"][0]["message"].get("content") or "").strip()
+                    if text:
+                        return text
+                    print("Empty reply from " + model + " (attempt " + str(attempt + 1) + "), retrying")
+                    max_tokens = int(max_tokens * 1.5)
+                    time.sleep(5)
+                    continue
 
-def pick_topics():
+                err      = data.get("error", {}) if isinstance(data, dict) else {}
+                err_code = str(err.get("code", ""))
+                err_msg  = str(err.get("message", ""))
+                last_error = data
+                print("Groq error [" + model + "] attempt " + str(attempt + 1) + ":", data)
+
+                if err_code == "model_not_found":
+                    break  # go to next model immediately
+                if "reasoning_effort" in err_msg:
+                    use_reasoning_param = False
+                    continue
+                if err_code == "rate_limit_exceeded" or resp.status_code == 429:
+                    time.sleep(40)
+                else:
+                    time.sleep(10)
+            except Exception as e:
+                last_error = str(e)
+                print("Request error [" + model + "] attempt " + str(attempt + 1) + ": " + str(e))
+                time.sleep(10)
+    raise Exception("Groq API failed on all models: " + str(last_error))
+
+
+# ---------------------------------------------------------------- Blogger
+def get_access_token():
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": REFRESH_TOKEN,
+        "grant_type":    "refresh_token"
+    }, timeout=30)
+    data = r.json()
+    if "access_token" not in data:
+        raise Exception("Blogger auth failed: " + str(data))
+    return data["access_token"]
+
+
+def get_recent_titles(token, limit=50):
+    """Titles of recent live + scheduled posts, so we don't repeat topics."""
+    try:
+        r = requests.get(
+            "https://www.googleapis.com/blogger/v3/blogs/" + BLOG_ID + "/posts",
+            headers={"Authorization": "Bearer " + token},
+            params=[("maxResults", limit), ("fetchBodies", "false"),
+                    ("status", "live"), ("status", "scheduled")],
+            timeout=30
+        )
+        items = r.json().get("items", [])
+        return [i.get("title", "") for i in items if i.get("title")]
+    except Exception as e:
+        print("Could not load recent titles: " + str(e))
+        return []
+
+
+def publish_post(title, content, tags, token, publish_time):
+    body = {
+        "kind":      "blogger#post",
+        "title":     title,
+        "content":   content,
+        "labels":    tags,
+        "published": publish_time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        "status":    "SCHEDULED"
+    }
+    r = requests.post(
+        "https://www.googleapis.com/blogger/v3/blogs/" + BLOG_ID + "/posts/?isDraft=false",
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        json=body,
+        timeout=60
+    )
+    data = r.json()
+    if "error" in data:
+        raise Exception("Blogger publish failed: " + str(data["error"]))
+    return data
+
+
+# ---------------------------------------------------------------- Topics
+RESEARCH_SEEDS = [
+    "spa sri lanka", "spa colombo", "massage sri lanka", "ayurvedic spa sri lanka",
+    "wellness sri lanka", "beauty salon colombo", "spa kandy", "spa galle",
+    "sl ads", "ads sl", "hela ads", "lanka ads", "ceylon ads", "spa ads",
+]
+RELEVANT_WORDS = ["spa", "massage", "wellness", "ayurved", "salon", "beauty", "ads", "classified"]
+
+
+def research_queries():
+    """Real Google autocomplete suggestions for Sri Lanka = what people actually type.
+    Unofficial endpoint: if it fails, the script just falls back to the topic bank."""
+    found = []
+    seeds = random.sample(RESEARCH_SEEDS, min(8, len(RESEARCH_SEEDS)))
+    for seed in seeds:
+        for suffix in ["", " best", " near", " price", " a"]:
+            try:
+                r = requests.get(
+                    "https://suggestqueries.google.com/complete/search",
+                    params={"client": "firefox", "q": seed + suffix, "hl": "en", "gl": "lk"},
+                    timeout=15
+                )
+                for sug in r.json()[1]:
+                    low = sug.lower()
+                    if sug not in found and any(w in low for w in RELEVANT_WORDS):
+                        found.append(sug)
+            except Exception:
+                pass
+        time.sleep(0.3)
+    print("  Research queries found: " + str(len(found)))
+    return found[:60]
+
+
+def pick_topics(recent_titles, research):
+    """Returns 3 tuples: (topic, primary_keyword)."""
     today   = datetime.now().strftime("%B %d, %Y")
     month   = datetime.now().strftime("%B %Y")
     cluster = get_todays_cluster()
     kw_list = ", ".join(cluster[:6])
-    sample  = random.sample(TOPIC_BANK, min(20, len(TOPIC_BANK)))
-    listed  = "\n".join("- " + t for t in sample)
+    sample  = random.sample(TOPIC_BANK, min(15, len(TOPIC_BANK)))
+    bank    = "\n".join("- " + t for t in sample)
+    searches = ""
+    if research:
+        searches = ("Real Google searches from Sri Lanka (search demand signals):\n"
+                    + "\n".join("- " + q for q in research) + "\n\n")
+    avoid = ""
+    if recent_titles:
+        avoid = ("Already published (do NOT repeat or closely copy):\n"
+                 + "\n".join("- " + t for t in recent_titles[:30]) + "\n\n")
     prompt = (
-        "You are a senior SEO strategist for ads-sl.com, Sri Lanka's top classified ads platform.\n\n"
+        "You are a senior SEO strategist for ads-sl.com, a Sri Lankan classified ads platform "
+        "with a strong spa and wellness category.\n\n"
         "Today: " + today + "\n"
-        "Target keywords: " + kw_list + "\n\n"
-        "Pick 3 BEST blog topics from this list for " + month + ":\n"
-        + listed + "\n\n"
-        "Rules:\n"
-        "1. Each topic must naturally include keywords like: sl ads, lanka ads, hela ads, ads sl, spa ads, ceylon ads\n"
-        "2. Cover different angles: one how-to, one list, one guide\n"
-        "3. Max 65 characters per title\n"
-        "4. High Google search potential in Sri Lanka\n\n"
-        "Return ONLY numbered list:\n1.\n2.\n3."
+        "Brand keywords to weave in: " + kw_list + "\n\n"
+        + searches + avoid +
+        "Backup topic ideas:\n" + bank + "\n\n"
+        "Choose the 3 best blog topics for " + month + ". Prefer topics that match the real searches above "
+        "(people clearly want this) and are not already published. Cover 3 different angles: "
+        "one how-to, one list, one guide.\n\n"
+        "For each topic also give ONE primary search keyword (2-5 words) that people really type.\n"
+        "Topic max 65 characters.\n\n"
+        "Return ONLY this format, nothing else:\n"
+        "1. Topic title | primary keyword\n2. Topic title | primary keyword\n3. Topic title | primary keyword"
     )
-    text   = ask_ai(prompt, 400)
+    text   = ask_ai(prompt, 2500)
     topics = []
     for line in text.strip().splitlines():
         line = line.strip()
         if line and line[0].isdigit() and "." in line:
-            t = line.split(".", 1)[-1].strip().strip('"').strip("'")
+            body = line.split(".", 1)[-1].strip().strip("*").strip()
+            if "|" in body:
+                t, k = body.split("|", 1)
+            else:
+                t, k = body, cluster[0]
+            t = t.strip().strip('"').strip("'").strip("*").strip()
+            k = k.strip().strip('"').strip("'").strip("*").strip() or cluster[0]
             if t:
-                topics.append(t)
+                topics.append((t, k))
+    if len(topics) < 3:  # safety net: fill from the bank
+        for t in random.sample(TOPIC_BANK, len(TOPIC_BANK)):
+            if t not in [x[0] for x in topics]:
+                topics.append((t, cluster[0]))
+            if len(topics) >= 3:
+                break
     return topics[:3]
 
-def get_image_url(topic):
-    seed    = int(hashlib.md5(topic.encode()).hexdigest()[:8], 16) % 9999
-    prompts = [
-        "luxury spa treatment Sri Lanka tropical flowers candles",
-        "beautiful Ceylon spa massage room relaxing atmosphere",
-        "Sri Lanka wellness center ayurvedic herbs treatment",
-        "Colombo spa beauty salon professional treatment",
-        "tropical spa resort Sri Lanka pool relaxation",
-        "herbal spa treatment Sri Lanka natural ingredients",
-        "couples spa retreat Sri Lanka beach resort",
-        "traditional Ceylon massage therapy wellness center",
-    ]
-    img_prompt = random.choice(prompts)
-    encoded = quote(img_prompt)
-    return "https://image.pollinations.ai/prompt/" + encoded + "?width=1200&height=630&nologo=true&seed=" + str(seed) + "&model=flux"
 
+# ---------------------------------------------------------------- Images
+def image_query_for(topic):
+    t = topic.lower()
+    if any(w in t for w in ["ayurved", "herb", "ancient", "ritual", "traditional"]):
+        return ["ayurveda spa treatment", "herbal massage spa", "spa herbs wellness"]
+    if any(w in t for w in ["beach", "resort", "negombo", "bentota", "mirissa", "galle", "southern"]):
+        return ["tropical beach resort spa", "spa resort pool", "luxury resort wellness"]
+    if any(w in t for w in ["couple", "gift", "romantic"]):
+        return ["couples spa massage", "spa candles flowers", "romantic spa"]
+    if any(w in t for w in ["skin", "anti-aging", "facial", "beauty"]):
+        return ["facial spa treatment", "skin care spa", "beauty salon treatment"]
+    if any(w in t for w in ["advertis", "business", "platform", "marketing", "grow", "post", "listing"]):
+        return ["spa reception", "spa interior", "wellness center interior"]
+    return ["spa massage", "wellness spa relaxation", "spa treatment room"]
+
+
+def image_from_pexels(topic, seed):
+    if not PEXELS_KEY:
+        return None
+    for q in image_query_for(topic):
+        try:
+            r = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers={"Authorization": PEXELS_KEY},
+                params={"query": q, "per_page": 15, "orientation": "landscape"},
+                timeout=30
+            )
+            photos = r.json().get("photos", [])
+            if photos:
+                p = photos[seed % len(photos)]
+                return {
+                    "url":    p["src"]["large"],
+                    "credit": p.get("photographer", "Pexels"),
+                    "link":   p.get("url", "https://www.pexels.com"),
+                }
+        except Exception as e:
+            print("  Pexels error: " + str(e))
+    return None
+
+
+def image_from_pollinations(topic, seed):
+    prompt = "professional photo, spa and wellness in Sri Lanka, " + topic + ", soft natural light, no text"
+    url = ("https://image.pollinations.ai/prompt/" + quote(prompt)
+           + "?width=1200&height=630&nologo=true&seed=" + str(seed))
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+            return {"url": url, "credit": None, "link": None}
+        print("  Pollinations returned " + str(r.status_code))
+    except Exception as e:
+        print("  Pollinations error: " + str(e))
+    return None
+
+
+def get_image_block(topic):
+    """Returns ready-to-insert HTML for the post image, or '' if no image could be found."""
+    seed = int(hashlib.md5((topic + datetime.now().strftime("%Y%m%d")).encode()).hexdigest()[:8], 16)
+    img = image_from_pexels(topic, seed) or image_from_pollinations(topic, seed)
+    if not img:
+        print("  No image available, posting without one")
+        return ""
+    alt = topic.replace('"', "'")
+    html = ('<img src="' + img["url"] + '" alt="' + alt
+            + '" style="width:100%;border-radius:12px;margin:0 0 8px 0;" />')
+    if img["credit"]:
+        html += ('<p style="font-size:11px;color:#6b7280;margin:0 0 24px 0;">Photo by '
+                 + img["credit"] + ' on <a href="' + img["link"]
+                 + '" target="_blank" rel="nofollow">Pexels</a></p>')
+    else:
+        html += '<div style="margin:0 0 24px 0;"></div>'
+    return html
+
+
+# ---------------------------------------------------------------- Content
 def get_promo_block():
     styles = [
         '<div style="background:linear-gradient(135deg,#667eea,#764ba2);padding:20px;border-radius:12px;margin:0 0 24px 0;text-align:center;">'
@@ -181,178 +392,13 @@ def get_promo_block():
     ]
     return random.choice(styles)
 
-def generate_post(topic, img_url, tags):
-    month_year  = datetime.now().strftime("%B %Y")
-    cluster     = get_todays_cluster()
-    kw_sample   = random.sample(cluster, min(6, len(cluster)))
-    kw_str      = ", ".join(kw_sample)
-    promo_block = get_promo_block()
-    tag_str     = ", ".join(tags[:6])
 
-    prompt = (
-        "You are an expert Sri Lankan spa and wellness blogger writing for " + month_year + ".\n\n"
-        "Topic: " + topic + "\n"
-        "MUST include these keywords naturally: sl ads, ads sl, lanka ads, hela ads, spa ads, ceylon ads, " + kw_str + "\n"
-        "Promote: " + SITE_URL + "\n\n"
-        "CRITICAL: Write ONLY in pure HTML. NO markdown. NO ## symbols. NO ** symbols. NO > symbols.\n\n"
-        "OUTPUT FORMAT:\n"
-        "TITLE: [SEO title max 65 chars]\n"
-        "---\n"
-        "[PROMO_BLOCK]\n\n"
-        '<img src="' + img_url + '" alt="' + topic + '" style="width:100%;border-radius:12px;margin:0 0 24px 0;" />\n\n'
-        "<p><strong>[Opening hook sentence about " + topic + "]</strong> [2 more sentences with sl ads or spa ads keyword naturally.]</p>\n\n"
-        "<p>[Second paragraph about what reader will learn. Mention ads-sl.com naturally.]</p>\n\n"
-        "<h2>[Section 1 heading with keyword]</h2>\n"
-        "<p>[Paragraph 1 with practical info and locations: Colombo, Kandy, Galle]</p>\n"
-        "<p>[Paragraph 2 with tips and hela ads or ceylon ads keyword]</p>\n"
-        "<h3>[Subtopic of section 1]</h3>\n"
-        "<p>[Detailed paragraph with specific numbers and advice]</p>\n"
-        '<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [One specific actionable tip]</blockquote>\n\n'
-        "<h2>[Section 2 heading with lanka ads or sl ads keyword]</h2>\n"
-        "<p>[Paragraph with info about finding services through sl ads or ads sl]</p>\n"
-        "<p>[Paragraph 2]</p>\n"
-        "<h3>[Subtopic]</h3>\n"
-        "<p>[Paragraph]</p>\n"
-        '<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [Tip]</blockquote>\n\n'
-        "<h2>[Section 3 heading]</h2>\n"
-        "<p>[Content mentioning Negombo, Bentota or Mirissa]</p>\n"
-        "<p>[Paragraph 2 with ceylon ads or hela ads keyword]</p>\n"
-        "<h3>[Subtopic]</h3>\n"
-        "<p>[Paragraph]</p>\n"
-        '<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [Tip]</blockquote>\n\n'
-        "<h2>[Section 4 heading]</h2>\n"
-        "<p>[Content]</p>\n"
-        "<ul>\n<li>[Tip 1]</li>\n<li>[Tip 2]</li>\n<li>[Tip 3]</li>\n<li>[Tip 4]</li>\n</ul>\n"
-        '<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [Tip]</blockquote>\n\n'
-        "<h2>[Section 5 heading]</h2>\n"
-        "<p>[Content mentioning ads-sl.com as best place for sl ads and spa ads]</p>\n"
-        "<p>[Paragraph 2]</p>\n"
-        '<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [Tip]</blockquote>\n\n'
-        '<div style="background:#f8fafc;border-radius:12px;padding:20px;margin:24px 0;">\n'
-        "<h2>Frequently Asked Questions</h2>\n"
-        "<h3>[Common question with sl ads or spa ads keyword]</h3>\n"
-        "<p>[Clear 2-3 sentence answer mentioning ads-sl.com]</p>\n"
-        "<h3>[Another question with ceylon ads or hela ads]</h3>\n"
-        "<p>[Clear answer]</p>\n"
-        "<h3>[Third question about finding spa services in Sri Lanka]</h3>\n"
-        "<p>[Clear answer with lanka ads keyword]</p>\n"
-        "</div>\n\n"
-        "<p>[Closing paragraph. Mention ads-sl.com naturally as best resource for sl ads, spa ads, hela ads and ceylon ads in Sri Lanka.]</p>\n"
-        "<p><em>[Engaging question asking readers to comment about their favorite Sri Lanka spa experience]</em></p>\n\n"
-        "STRICT RULES:\n"
-        "- 1200 to 1500 words\n"
-        "- Pure HTML ONLY. Zero markdown.\n"
-        "- Use sl ads, ads sl, lanka ads, hela ads, spa ads, ceylon ads each at least once\n"
-        "- Warm friendly tone like a local Sri Lankan friend\n"
-        "- Sound 100 percent human\n"
-        "- Write [PROMO_BLOCK] as exact placeholder"
-    )
-
-    raw = ask_ai(prompt, 4000)
-    raw = raw.replace("[PROMO_BLOCK]", promo_block)
-    return raw
-
-def parse_post(raw, fallback_tags):
-    lines         = raw.strip().splitlines()
-    title         = "Sri Lanka Spa Guide " + datetime.now().strftime("%B %d %Y")
-    tags          = fallback_tags
-    content_lines = []
-    in_content    = False
-    for line in lines:
-        if line.startswith("TITLE:"):
-            title = line.replace("TITLE:", "").strip().strip('"')
-        elif line.strip() == "---":
-            in_content = True
-        elif in_content:
-            content_lines.append(line)
-    if not content_lines:
-        content_lines = [l for l in lines if not l.startswith(("TITLE:", "META:", "---"))]
-    return title, "\n".join(content_lines), tags
-
-def get_access_token():
-    r = requests.post("https://oauth2.googleapis.com/token", data={
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "refresh_token": REFRESH_TOKEN,
-        "grant_type":    "refresh_token"
-    })
-    data = r.json()
-    if "access_token" not in data:
-        raise Exception("Blogger auth failed: " + str(data))
-    return data["access_token"]
-
-def publish_post(title, content, tags, token, publish_time):
-    body = {
-        "kind":      "blogger#post",
-        "title":     title,
-        "content":   content,
-        "labels":    tags,
-        "published": publish_time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-        "status":    "SCHEDULED"
-    }
-    r = requests.post(
-        "https://www.googleapis.com/blogger/v3/blogs/" + BLOG_ID + "/posts/?isDraft=false",
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
-        json=body
-    )
-    return r.json()
-
-def main():
-    cluster = get_todays_cluster()
-    print("=" * 55)
-    print("Ads-SL Blog - " + datetime.now().strftime("%Y-%m-%d %H:%M UTC"))
-    print("Site: " + SITE_URL)
-    print("Keywords: " + cluster[0] + ", " + cluster[1])
-    print("=" * 55)
-
-    publish_times = get_publish_times()
-    print("Schedule:")
-    for i, t in enumerate(publish_times, 1):
-        sl = t + timedelta(hours=5, minutes=30)
-        print("  Post " + str(i) + ": " + t.strftime("%H:%M") + " UTC / " + sl.strftime("%H:%M") + " SL")
-
-    print("\nResearching topics...")
-    topics = pick_topics()
-    if not topics:
-        print("ERROR: No topics")
-        return
-    for i, t in enumerate(topics, 1):
-        print("  " + str(i) + ". " + t)
-
-    token   = get_access_token()
-    success = 0
-    print("\nWriting posts...\n")
-
-    for i, topic in enumerate(topics, 1):
-        print("[" + str(i) + "/3] " + topic[:60])
-        shuffled  = cluster.copy()
-        random.shuffle(shuffled)
-        post_tags = shuffled[:10]
-        try:
-            print("  Getting image...")
-            img_url = get_image_url(topic)
-            print("  Writing post...")
-            raw = generate_post(topic, img_url, post_tags)
-            title, content, tags = parse_post(raw, post_tags)
-            pub_time = publish_times[i - 1]
-            result   = publish_post(title, content, tags, token, pub_time)
-            url      = result.get("url", "scheduled")
-            sl_time  = pub_time + timedelta(hours=5, minutes=30)
-            print("  OK: " + pub_time.strftime("%H:%M") + " UTC / " + sl_time.strftime("%H:%M") + " SL")
-            print("  " + str(url) + "\n")
-            success += 1
-        except Exception as e:
-            print("  ERROR: " + str(e) + "\n")
-        if i < len(topics):
-            wait = random.randint(20, 35)
-            print("  Waiting " + str(wait) + "s...\n")
-            time.sleep(wait)
-
-    print("=" * 55)
-    print("Done: " + str(success) + "/3 posts scheduled")
-    print("All promoting: " + SITE_URL)
-    print("=" * 55)
+TIP = ('<blockquote style="border-left:4px solid #764ba2;padding:12px 16px;background:#f8f7ff;'
+       'margin:16px 0;border-radius:0 8px 8px 0;"><strong>Expert Tip:</strong> [One specific actionable tip]</blockquote>\n\n')
 
 
-if __name__ == "__main__":
-    main()
+def generate_post(topic, keyword, img_block):
+    month_year = datetime.now().strftime("%B %Y")
+    cluster    = get_todays_cluster()
+    kw_sample  = random.sample(cluster, min(6, len(cluster)))
+    kw_str     = ", ".jo
